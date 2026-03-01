@@ -3,3 +3,4 @@ dist/
 .vite/
 .DS_Store
 npm-debug.log*
+.vercel

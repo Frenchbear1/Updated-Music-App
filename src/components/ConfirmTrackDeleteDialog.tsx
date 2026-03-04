@@ -21,7 +21,7 @@ export const ConfirmTrackDeleteDialog = ({ open, trackName, onClose, onConfirm }
             Move to trash
           </button>
           <button className="chip danger" onClick={() => onConfirm("delete")}>
-            Delete from device
+            Delete from disk
           </button>
         </div>
       </div>

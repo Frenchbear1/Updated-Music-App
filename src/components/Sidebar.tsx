@@ -1,32 +1,48 @@
-import { FolderPlus, ImagePlus, Music2, Pencil, RefreshCw, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { FolderPlus, GripVertical, Music2, Pencil, RefreshCw, Trash2 } from "lucide-react";
+import { useEffect, useState } from "react";
 import { Reorder } from "framer-motion";
 import type { LibrarySource, Playlist } from "../types/media";
 
 interface SidebarProps {
   sources: LibrarySource[];
   playlists: Playlist[];
+  librarySummaryText: string;
   selectedPlaylistId: string | null;
   onSelectPlaylist: (id: string) => void;
+  isRefreshing: boolean;
+  isRefreshDisabled: boolean;
   onImport: () => void;
-  onImportCoverDatabase: () => void;
   onRefreshAll: () => void;
-  onRemoveSource: (id: string) => void;
+  onBulkRemovePlaylists: (playlistIds: string[]) => void;
   onReorderPlaylists: (sourceId: string, orderedPlaylistIds: string[]) => void;
 }
 
 export const Sidebar = ({
   sources,
   playlists,
+  librarySummaryText,
   selectedPlaylistId,
   onSelectPlaylist,
+  isRefreshing,
+  isRefreshDisabled,
   onImport,
-  onImportCoverDatabase,
   onRefreshAll,
-  onRemoveSource,
+  onBulkRemovePlaylists,
   onReorderPlaylists
 }: SidebarProps): JSX.Element => {
   const [editMode, setEditMode] = useState(false);
+  const [selectedPlaylistIds, setSelectedPlaylistIds] = useState<string[]>([]);
+
+  useEffect(() => {
+    const validIds = new Set(playlists.map((playlist) => playlist.id));
+    setSelectedPlaylistIds((current) => current.filter((id) => validIds.has(id)));
+  }, [playlists]);
+
+  useEffect(() => {
+    if (!editMode) {
+      setSelectedPlaylistIds([]);
+    }
+  }, [editMode]);
 
   const reorderAcrossFlatList = (orderedPlaylistIds: string[]): void => {
     const byPlaylistId = new Map(playlists.map((playlist) => [playlist.id, playlist]));
@@ -48,13 +64,40 @@ export const Sidebar = ({
     }
   };
 
+  const togglePlaylistSelection = (playlistId: string): void => {
+    setSelectedPlaylistIds((current) =>
+      current.includes(playlistId)
+        ? current.filter((id) => id !== playlistId)
+        : [...current, playlistId]
+    );
+  };
+
+  const hasBulkSelection = selectedPlaylistIds.length > 0;
+
   return (
-    <aside className="sidebar glass">
+    <aside className={`sidebar glass ${sources.length > 0 ? "has-footer" : ""}`}>
       <div className="sidebar-header">
         <h1>PulseDeck</h1>
         <div className="sidebar-head-actions">
-          <button className="icon-btn" onClick={onRefreshAll} title="Refresh all" aria-label="Refresh all">
-            <RefreshCw size={16} />
+          {editMode ? (
+            <button
+              className="icon-btn danger bulk-remove-chip"
+              onClick={() => onBulkRemovePlaylists(selectedPlaylistIds)}
+              disabled={!hasBulkSelection}
+              title={hasBulkSelection ? `Move ${selectedPlaylistIds.length} selected folders to trash` : "Select folders to bulk delete"}
+              aria-label={hasBulkSelection ? `Bulk delete ${selectedPlaylistIds.length} folders` : "Select folders to bulk delete"}
+            >
+              <Trash2 size={14} />
+            </button>
+          ) : null}
+          <button
+            className="icon-btn"
+            onClick={onRefreshAll}
+            title={isRefreshing ? "Refreshing library" : "Refresh all"}
+            aria-label={isRefreshing ? "Refreshing library" : "Refresh all"}
+            disabled={isRefreshDisabled}
+          >
+            <RefreshCw size={16} className={isRefreshing ? "spin-icon" : undefined} />
           </button>
           <button
             className={`icon-btn ${editMode ? "active-toggle" : ""}`}
@@ -64,16 +107,8 @@ export const Sidebar = ({
           >
             <Pencil size={16} />
           </button>
-          <button className="icon-btn" onClick={onImport} title="Import folder" aria-label="Import folder">
+          <button className="icon-btn" onClick={onImport} title="Import folders" aria-label="Import folders">
             <FolderPlus size={18} />
-          </button>
-          <button
-            className="icon-btn"
-            onClick={onImportCoverDatabase}
-            title="Import covers database"
-            aria-label="Import covers database"
-          >
-            <ImagePlus size={18} />
           </button>
         </div>
       </div>
@@ -81,7 +116,7 @@ export const Sidebar = ({
       <div className="section-label">Library</div>
 
       {sources.length === 0 ? (
-        <p className="empty-note">Import a folder to create your first playlist.</p>
+        <p className="empty-note">Import a folder or files to create your first playlist.</p>
       ) : (
         <>
           {editMode ? (
@@ -97,24 +132,23 @@ export const Sidebar = ({
                   }}
                 >
                   <div className="playlist-row">
+                    <label className="playlist-check-wrap" title={`Select ${playlist.name}`} onPointerDown={(event) => event.stopPropagation()}>
+                      <input
+                        className="playlist-check"
+                        type="checkbox"
+                        checked={selectedPlaylistIds.includes(playlist.id)}
+                        onChange={() => togglePlaylistSelection(playlist.id)}
+                        onClick={(event) => event.stopPropagation()}
+                      />
+                    </label>
                     <button
                       className={`playlist-btn drag-enabled ${selectedPlaylistId === playlist.id ? "active" : ""}`}
                       onClick={() => onSelectPlaylist(playlist.id)}
                       title={playlist.name}
                     >
-                      <Music2 size={14} />
+                      <GripVertical size={14} />
                       <span>{playlist.name}</span>
                     </button>
-                    <div className="playlist-actions">
-                      <button
-                        className="icon-btn danger"
-                        onClick={() => onRemoveSource(playlist.sourceId)}
-                        title="Remove source"
-                        aria-label={`Remove ${playlist.name}`}
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
                   </div>
                 </Reorder.Item>
               ))}
@@ -139,6 +173,7 @@ export const Sidebar = ({
           )}
         </>
       )}
+      {sources.length > 0 ? <div className="sidebar-footer-floating">{librarySummaryText}</div> : null}
     </aside>
   );
 };

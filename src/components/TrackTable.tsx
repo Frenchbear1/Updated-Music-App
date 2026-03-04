@@ -11,6 +11,7 @@ export interface TrackGroup {
 interface TrackTableProps {
   tracks: Track[];
   groups?: TrackGroup[];
+  footerText?: string;
   currentTrackId: string | null;
   onPlay: (track: Track) => void;
   onToggleFavorite: (trackId: string) => void;
@@ -20,6 +21,7 @@ interface TrackTableProps {
 export const TrackTable = ({
   tracks,
   groups,
+  footerText,
   currentTrackId,
   onPlay,
   onToggleFavorite,
@@ -115,7 +117,7 @@ export const TrackTable = ({
   };
 
   return (
-    <div className="track-list glass">
+    <div className={`track-list glass ${footerText ? "has-footer" : ""}`}>
       {hasGroups
         ? groups!.map((group) => (
             <section key={group.id} className="search-group-card">
@@ -129,6 +131,7 @@ export const TrackTable = ({
             </section>
           ))
         : tracks.map((track) => renderTrackRow(track))}
+      {footerText ? <div className="playlist-footer-floating">{footerText}</div> : null}
     </div>
   );
 };

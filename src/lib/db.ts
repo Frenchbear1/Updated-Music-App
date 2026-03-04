@@ -5,9 +5,11 @@ import type {
   ArtworkRecord,
   EntityArtworkLink,
   FolderHandleRecord,
+  IgnoredTrackPath,
   LibrarySource,
   MetadataHitCacheEntry,
   Playlist,
+  TrackFileBlobRecord,
   Track,
   TrackArtworkLink,
   TrashedSource,
@@ -25,6 +27,8 @@ class MediaDB extends Dexie {
   entityArtworks!: Table<EntityArtworkLink, string>;
   metadataHitCache!: Table<MetadataHitCacheEntry, string>;
   folderHandles!: Table<FolderHandleRecord, string>;
+  trackFileBlobs!: Table<TrackFileBlobRecord, string>;
+  ignoredTrackPaths!: Table<IgnoredTrackPath, string>;
   trashedSources!: Table<TrashedSource, string>;
   trashedTracks!: Table<TrashedTrack, string>;
 
@@ -104,6 +108,37 @@ class MediaDB extends Dexie {
           }
         }
       });
+    this.version(6).stores({
+      sources: "id, name, updatedAt",
+      playlists: "id, sourceId, updatedAt",
+      tracks: "id, playlistId, sourceId, favorite, artworkId, artworkSource, updatedAt",
+      artworkCache: "key, updatedAt",
+      artworks: "id, source, path, optimizedPath, updatedAt",
+      artworkFullBlobs: "id, updatedAt",
+      trackArtworks: "[trackId+artworkId], trackId, artworkId, updatedAt",
+      entityArtworks: "id, [entityType+entityKey], entityType, entityKey, trackId, artworkId, updatedAt",
+      metadataHitCache: "id, [source+queryKey], source, queryKey, updatedAt",
+      folderHandles: "handleKey",
+      trackFileBlobs: "trackId, updatedAt",
+      trashedSources: "id, trashedAt",
+      trashedTracks: "id, trashedAt"
+    });
+    this.version(7).stores({
+      sources: "id, name, updatedAt",
+      playlists: "id, sourceId, updatedAt",
+      tracks: "id, playlistId, sourceId, favorite, artworkId, artworkSource, updatedAt",
+      artworkCache: "key, updatedAt",
+      artworks: "id, source, path, optimizedPath, updatedAt",
+      artworkFullBlobs: "id, updatedAt",
+      trackArtworks: "[trackId+artworkId], trackId, artworkId, updatedAt",
+      entityArtworks: "id, [entityType+entityKey], entityType, entityKey, trackId, artworkId, updatedAt",
+      metadataHitCache: "id, [source+queryKey], source, queryKey, updatedAt",
+      folderHandles: "handleKey",
+      trackFileBlobs: "trackId, updatedAt",
+      ignoredTrackPaths: "id, sourceId, relativePath, updatedAt",
+      trashedSources: "id, trashedAt",
+      trashedTracks: "id, trashedAt"
+    });
   }
 }
 

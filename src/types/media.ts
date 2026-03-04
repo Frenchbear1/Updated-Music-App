@@ -3,11 +3,13 @@ export type RepeatMode = "off" | "one" | "two";
 export type ArtworkSource = "LOCAL" | "REMOTE";
 export type ArtworkEntityType = "album" | "artist" | "genre";
 export type MetadataSource = "MUSIXMATCH" | "ITUNES" | "GENIUS" | "DEEZER" | "LAST_FM";
+export type AppDataClearTarget = "favorites" | "song_images" | "songs_playlists" | "trash" | "metadata_cache";
 
 export interface LibrarySource {
   id: string;
   name: string;
   handleKey: string;
+  importType?: "folder" | "files";
   createdAt: number;
   updatedAt: number;
 }
@@ -121,6 +123,19 @@ export interface MetadataHitCacheEntry {
 export interface FolderHandleRecord {
   handleKey: string;
   handle: FileSystemDirectoryHandle;
+}
+
+export interface TrackFileBlobRecord {
+  trackId: string;
+  fileBlob: Blob;
+  updatedAt: number;
+}
+
+export interface IgnoredTrackPath {
+  id: string;
+  sourceId: string;
+  relativePath: string;
+  updatedAt: number;
 }
 
 export interface TrashedSource {

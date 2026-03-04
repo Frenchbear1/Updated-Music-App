@@ -10,10 +10,12 @@ export interface ParsedAudioMetadata {
   trackNumber?: number;
   year?: number;
   genres?: string[];
+  durationSec?: number;
   artwork?: ParsedEmbeddedArtwork;
 }
 
 const MAX_EMBEDDED_TAG_READ_BYTES = 12 * 1024 * 1024;
+const AUDIO_DURATION_TIMEOUT_MS = 12_000;
 
 const cleanText = (value?: string): string | undefined => {
   const normalized = value?.replace(/\u0000/g, "").trim();
@@ -296,12 +298,64 @@ const readLikelyTagBytes = async (file: File): Promise<Uint8Array> => {
   return bytes;
 };
 
+const readAudioDurationSeconds = async (file: File): Promise<number | undefined> => {
+  const objectUrl = URL.createObjectURL(file);
+  const audio = document.createElement("audio");
+  audio.preload = "metadata";
+  audio.src = objectUrl;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeoutId: number | null = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(undefined);
+    }, AUDIO_DURATION_TIMEOUT_MS);
+
+    const cleanup = (): void => {
+      audio.removeEventListener("loadedmetadata", onLoadedMetadata);
+      audio.removeEventListener("error", onError);
+      audio.removeAttribute("src");
+      audio.load();
+      URL.revokeObjectURL(objectUrl);
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+    };
+
+    const onLoadedMetadata = (): void => {
+      if (settled) return;
+      settled = true;
+      const duration = audio.duration;
+      cleanup();
+      if (Number.isFinite(duration) && duration > 0) {
+        resolve(Math.round(duration));
+        return;
+      }
+      resolve(undefined);
+    };
+
+    const onError = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(undefined);
+    };
+
+    audio.addEventListener("loadedmetadata", onLoadedMetadata);
+    audio.addEventListener("error", onError);
+  });
+};
+
 export const parseAudioFileMetadata = async (file: File): Promise<ParsedAudioMetadata> => {
   const bytes = await readLikelyTagBytes(file);
 
   let metadata: ParsedAudioMetadata = {};
   metadata = mergeMetadata(metadata, parseId3Tags(bytes));
   metadata = mergeMetadata(metadata, parseFlacMetadata(bytes));
+  metadata.durationSec = await readAudioDurationSeconds(file);
 
   return metadata;
 };

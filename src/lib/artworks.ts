@@ -39,6 +39,16 @@ interface NormalizedArtworkBlobData {
 }
 
 const objectUrlCache = new Map<string, UrlCacheEntry>();
+const TRACK_ID_CHUNK_SIZE = 250;
+
+const chunkArray = <T>(items: T[], size: number): T[][] => {
+  if (items.length === 0) return [];
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+};
 
 const makeId = (value: string): string => {
   let hash = 0;
@@ -347,7 +357,10 @@ export const fetchArtworkBlobFromUrl = async (url: string, signal?: AbortSignal)
   const normalized = cleanText(url);
   if (!normalized) return null;
   try {
-    const response = await fetch(normalized, { signal });
+    const requestUrl = import.meta.env.DEV
+      ? `/api/artwork-proxy?url=${encodeURIComponent(normalized)}`
+      : normalized;
+    const response = await fetch(requestUrl, { signal });
     if (!response.ok) return null;
     const blob = await response.blob();
     if (!blob.type.startsWith("image/")) return null;
@@ -442,13 +455,18 @@ export const removeArtworkAssociationsForTracks = async (trackIds: string[]): Pr
   const ids = Array.from(new Set(trackIds.filter(Boolean)));
   if (ids.length === 0) return;
 
-  const previousLinks = await db.trackArtworks.where("trackId").anyOf(ids).toArray();
-  const previousArtworkIds = previousLinks.map((link) => link.artworkId);
+  const previousArtworkIds: string[] = [];
+  const chunks = chunkArray(ids, TRACK_ID_CHUNK_SIZE);
 
-  await db.transaction("rw", db.trackArtworks, db.entityArtworks, async () => {
-    await db.trackArtworks.where("trackId").anyOf(ids).delete();
-    await db.entityArtworks.where("trackId").anyOf(ids).delete();
-  });
+  for (const chunk of chunks) {
+    const previousLinks = await db.trackArtworks.where("trackId").anyOf(chunk).toArray();
+    previousArtworkIds.push(...previousLinks.map((link) => link.artworkId));
+
+    await db.transaction("rw", db.trackArtworks, db.entityArtworks, async () => {
+      await db.trackArtworks.where("trackId").anyOf(chunk).delete();
+      await db.entityArtworks.where("trackId").anyOf(chunk).delete();
+    });
+  }
 
   if (previousArtworkIds.length > 0) {
     await removeOrphanArtworks(previousArtworkIds);

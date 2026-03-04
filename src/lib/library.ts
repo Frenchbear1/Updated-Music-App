@@ -4,18 +4,23 @@ import { fetchArtworkBlobFromUrl, hydrateTrackWithArtworkUrl, hydrateTracksWithA
 import { parseAudioFileMetadata } from "./embeddedMetadata";
 import { searchSongMetadataResultsInInternet } from "./internetMetadata";
 import type {
+  AppDataClearTarget,
   ArtworkCacheEntry,
   ImportResult,
   LibrarySource,
   Playlist,
   RefreshResult,
   SongMetadataResultFromInternet,
+  TrackFileBlobRecord,
   Track,
   TrashedSource,
   TrashedTrack
 } from "../types/media";
 
 const AUDIO_EXTENSIONS = new Set(["mp3", "wav", "m4a", "flac", "ogg", "aac"]);
+const DELETE_CHUNK_SIZE = 250;
+const APP_RECYCLE_DIRECTORY_NAME = "PulseDeck Trash";
+const LEGACY_APP_RECYCLE_DIRECTORY_NAME = ".pulsedeck-recycle";
 
 interface ScannedFile {
   name: string;
@@ -25,43 +30,8 @@ interface ScannedFile {
   pathHint: string;
 }
 
-interface ExportedPlaylistTrack {
-  title?: string;
-  artist?: string;
-  album?: string;
-  artworkFile?: string;
-  artworkUrl?: string;
-}
-
-interface ExportedPlaylistPayload {
-  tracks?: ExportedPlaylistTrack[];
-}
-
-interface ExportedPlaylistJsonFile {
-  directory: FileSystemDirectoryHandle;
-  fileName: string;
-}
-
-interface PendingArtworkCacheEntry {
-  album?: string;
-  artworkUrl?: string;
-}
-
-interface ImportedCoverCandidate {
-  title: string;
-  artist?: string;
-  album?: string;
-  artworkUrl?: string;
-  normalizedTitle: string;
-  canonicalTitle: string;
-}
-
-export interface CoverDatabaseImportResult {
-  playlistFiles: number;
-  cacheEntries: number;
-  tracksUpdated: number;
-  coversResolved: number;
-  coversMissing: number;
+interface ScannedInputFile extends ScannedFile {
+  file: File;
 }
 
 const splitTitleArtist = (fileName: string): { title: string; artist: string } => {
@@ -92,7 +62,106 @@ const isAudioFile = (name: string): boolean => {
   return Boolean(ext && AUDIO_EXTENSIONS.has(ext));
 };
 
+const isAudioInputFile = (file: File): boolean => {
+  if (isAudioFile(file.name)) return true;
+  return file.type?.toLowerCase().startsWith("audio/") ?? false;
+};
+
 const joinPath = (segments: string[]): string => segments.join("/");
+
+const chunkArray = <T>(items: T[], size: number): T[][] => {
+  if (items.length === 0) return [];
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+};
+
+const normalizeRelativePath = (value: string): string => {
+  return value.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+};
+
+const makeIgnoredTrackPathId = (sourceId: string, relativePath: string): string => {
+  return `${sourceId}::${normalizeRelativePath(relativePath)}`;
+};
+
+const isAppRecycleDirectory = (name: string): boolean => {
+  return name === APP_RECYCLE_DIRECTORY_NAME || name === LEGACY_APP_RECYCLE_DIRECTORY_NAME;
+};
+
+const buildIgnoredTrackPathRecords = (tracks: Track[]): Array<{ id: string; sourceId: string; relativePath: string; updatedAt: number }> => {
+  const now = Date.now();
+  const byId = new Map<string, { id: string; sourceId: string; relativePath: string; updatedAt: number }>();
+  for (const track of tracks) {
+    const normalizedPath = normalizeRelativePath(track.relativePath);
+    if (!normalizedPath) continue;
+    const id = makeIgnoredTrackPathId(track.sourceId, normalizedPath);
+    byId.set(id, {
+      id,
+      sourceId: track.sourceId,
+      relativePath: normalizedPath,
+      updatedAt: now
+    });
+  }
+  return Array.from(byId.values());
+};
+
+const buildIgnoredTrackPathIds = (tracks: Track[]): string[] => {
+  return Array.from(
+    new Set(
+      tracks
+        .map((track) => makeIgnoredTrackPathId(track.sourceId, track.relativePath))
+        .filter((id) => Boolean(id))
+    )
+  );
+};
+
+const getIgnoredRelativePathSetForSource = async (sourceId: string): Promise<Set<string>> => {
+  const ignored = await db.ignoredTrackPaths.where("sourceId").equals(sourceId).toArray();
+  return new Set(
+    ignored
+      .map((entry) => normalizeRelativePath(entry.relativePath))
+      .filter((relativePath) => Boolean(relativePath))
+  );
+};
+
+const ensureUniqueRelativePath = (candidate: string, usedPaths: Set<string>): string => {
+  const normalized = normalizeRelativePath(candidate);
+  if (!normalized) {
+    const fallback = `track-${usedPaths.size + 1}`;
+    usedPaths.add(fallback);
+    return fallback;
+  }
+
+  if (!usedPaths.has(normalized)) {
+    usedPaths.add(normalized);
+    return normalized;
+  }
+
+  const dotIndex = normalized.lastIndexOf(".");
+  if (dotIndex <= 0) {
+    let suffix = 1;
+    let candidatePath = `${normalized} (${suffix})`;
+    while (usedPaths.has(candidatePath)) {
+      suffix += 1;
+      candidatePath = `${normalized} (${suffix})`;
+    }
+    usedPaths.add(candidatePath);
+    return candidatePath;
+  }
+
+  const name = normalized.slice(0, dotIndex);
+  const ext = normalized.slice(dotIndex);
+  let suffix = 1;
+  let candidatePath = `${name} (${suffix})${ext}`;
+  while (usedPaths.has(candidatePath)) {
+    suffix += 1;
+    candidatePath = `${name} (${suffix})${ext}`;
+  }
+  usedPaths.add(candidatePath);
+  return candidatePath;
+};
 
 const scanRecursive = async (
   dirHandle: FileSystemDirectoryHandle,
@@ -112,6 +181,9 @@ const scanRecursive = async (
       });
     }
     if (handle.kind === "directory") {
+      if (isAppRecycleDirectory(name)) {
+        continue;
+      }
       const nested = await scanRecursive(handle as FileSystemDirectoryHandle, [...prefix, name]);
       items.push(...nested);
     }
@@ -130,6 +202,9 @@ const buildLibraryFromHandle = async (
 
   for await (const [name, handle] of rootHandle.entries()) {
     if (handle.kind === "directory") {
+      if (isAppRecycleDirectory(name)) {
+        continue;
+      }
       childDirectories.push({ name, handle: handle as FileSystemDirectoryHandle });
     }
     if (handle.kind === "file" && isAudioFile(name)) {
@@ -266,6 +341,70 @@ const buildLibraryFromHandle = async (
   return { playlists, tracks };
 };
 
+const buildLibraryFromInputFiles = (
+  sourceId: string,
+  sourceName: string,
+  files: File[]
+): { playlists: Playlist[]; tracks: Track[]; filesByTrackId: Map<string, File> } => {
+  const updatedAt = Date.now();
+  const playlistId = makeId(`${sourceId}:${sourceName}`);
+  const usedPaths = new Set<string>();
+  const scannedFiles: ScannedInputFile[] = [];
+
+  for (const file of files) {
+    if (!isAudioInputFile(file)) continue;
+    const parsed = splitTitleArtist(file.name);
+    const rawRelativePath = normalizeRelativePath(file.webkitRelativePath?.trim() || file.name.trim());
+    const relativePath = ensureUniqueRelativePath(rawRelativePath || file.name, usedPaths);
+
+    scannedFiles.push({
+      file,
+      name: parsed.title,
+      artist: parsed.artist,
+      fileName: file.name,
+      relativePath,
+      pathHint: relativePath
+    });
+  }
+
+  if (scannedFiles.length === 0) {
+    throw new Error("No supported audio files were selected");
+  }
+
+  const filesByTrackId = new Map<string, File>();
+  const tracks: Track[] = scannedFiles.map((item) => {
+    const id = makeId(`${playlistId}:${item.relativePath}`);
+    filesByTrackId.set(id, item.file);
+    return {
+      id,
+      playlistId,
+      sourceId,
+      name: item.name,
+      artist: item.artist,
+      album: sourceName,
+      fileName: item.fileName,
+      pathHint: item.pathHint,
+      relativePath: item.relativePath,
+      favorite: false,
+      updatedAt
+    } satisfies Track;
+  });
+
+  const playlists: Playlist[] = [
+    {
+      id: playlistId,
+      sourceId,
+      name: sourceName,
+      sourceType: "root",
+      trackIds: tracks.map((item) => item.id),
+      order: 0,
+      updatedAt
+    }
+  ];
+
+  return { playlists, tracks, filesByTrackId };
+};
+
 const enrichTracksWithEmbeddedMetadata = async (
   rootHandle: FileSystemDirectoryHandle,
   scannedTracks: Track[],
@@ -287,7 +426,8 @@ const enrichTracksWithEmbeddedMetadata = async (
       acoustIdFingerprint: previous?.acoustIdFingerprint,
       musicBrainzRecordingId: previous?.musicBrainzRecordingId,
       musicBrainzReleaseId: previous?.musicBrainzReleaseId,
-      genres: previous?.genres
+      genres: previous?.genres,
+      durationSec: previous?.durationSec
     };
 
     try {
@@ -305,7 +445,11 @@ const enrichTracksWithEmbeddedMetadata = async (
         name: parsedMetadata.title || nextTrack.name,
         artist: parsedMetadata.artist || nextTrack.artist,
         album: parsedMetadata.album || nextTrack.album,
-        genres: parsedMetadata.genres && parsedMetadata.genres.length > 0 ? parsedMetadata.genres : nextTrack.genres
+        genres: parsedMetadata.genres && parsedMetadata.genres.length > 0 ? parsedMetadata.genres : nextTrack.genres,
+        durationSec:
+          typeof parsedMetadata.durationSec === "number" && Number.isFinite(parsedMetadata.durationSec) && parsedMetadata.durationSec > 0
+            ? parsedMetadata.durationSec
+            : nextTrack.durationSec
       };
 
       if (parsedMetadata.artwork?.blob) {
@@ -319,6 +463,52 @@ const enrichTracksWithEmbeddedMetadata = async (
   }
 
   return { tracks: enrichedTracks, localArtworks };
+};
+
+const enrichTracksWithEmbeddedMetadataFromInputFiles = async (
+  scannedTracks: Track[],
+  filesByTrackId: Map<string, File>
+): Promise<{ tracks: Track[]; localArtworks: Map<string, Blob>; trackFileBlobs: TrackFileBlobRecord[] }> => {
+  const localArtworks = new Map<string, Blob>();
+  const enrichedTracks: Track[] = [];
+  const trackFileBlobs: TrackFileBlobRecord[] = [];
+  const updatedAt = Date.now();
+
+  for (const track of scannedTracks) {
+    const sourceFile = filesByTrackId.get(track.id);
+    if (!sourceFile) continue;
+
+    let nextTrack: Track = track;
+    try {
+      const parsedMetadata = await parseAudioFileMetadata(sourceFile);
+      nextTrack = {
+        ...track,
+        name: parsedMetadata.title || track.name,
+        artist: parsedMetadata.artist || track.artist,
+        album: parsedMetadata.album || track.album,
+        genres: parsedMetadata.genres && parsedMetadata.genres.length > 0 ? parsedMetadata.genres : track.genres,
+        durationSec:
+          typeof parsedMetadata.durationSec === "number" && Number.isFinite(parsedMetadata.durationSec) && parsedMetadata.durationSec > 0
+            ? parsedMetadata.durationSec
+            : track.durationSec
+      };
+
+      if (parsedMetadata.artwork?.blob) {
+        localArtworks.set(track.id, parsedMetadata.artwork.blob);
+      }
+    } catch {
+      // Keep scan resilient: metadata extraction failures should not block import.
+    }
+
+    trackFileBlobs.push({
+      trackId: track.id,
+      fileBlob: sourceFile,
+      updatedAt
+    });
+    enrichedTracks.push(nextTrack);
+  }
+
+  return { tracks: enrichedTracks, localArtworks, trackFileBlobs };
 };
 
 export const getLibrary = async (): Promise<{
@@ -355,6 +545,7 @@ export const importFolder = async (): Promise<ImportResult> => {
     id: sourceId,
     name: rootHandle.name,
     handleKey,
+    importType: "folder",
     createdAt: now,
     updatedAt: now
   };
@@ -386,10 +577,122 @@ export const importFolder = async (): Promise<ImportResult> => {
   return { source, playlists, tracks: await hydrateTracksWithArtworkUrls(persistedTracks) };
 };
 
+export const importFiles = async (files: File[]): Promise<ImportResult> => {
+  const audioFiles = files.filter((file) => isAudioInputFile(file));
+  if (audioFiles.length === 0) {
+    throw new Error("No supported audio files were selected");
+  }
+
+  const now = Date.now();
+  const sourceName =
+    normalizeImportString(audioFiles[0]?.webkitRelativePath?.split("/").filter(Boolean)[0]) || `Imported files ${new Date(now).toLocaleDateString()}`;
+  const sourceIdentity = audioFiles
+    .slice(0, 6)
+    .map((file) => `${file.name}:${file.size}:${file.lastModified}`)
+    .join("|");
+  const sourceId = makeId(`source:files:${sourceName}:${now}:${audioFiles.length}:${sourceIdentity}`);
+  const handleKey = makeId(`files:${sourceId}`);
+
+  const source: LibrarySource = {
+    id: sourceId,
+    name: sourceName,
+    handleKey,
+    importType: "files",
+    createdAt: now,
+    updatedAt: now
+  };
+
+  const { playlists, tracks: scannedTracks, filesByTrackId } = buildLibraryFromInputFiles(sourceId, sourceName, audioFiles);
+  const { tracks: metadataTracks, localArtworks, trackFileBlobs } = await enrichTracksWithEmbeddedMetadataFromInputFiles(scannedTracks, filesByTrackId);
+  const tracks = await applyOfflineArtworkDatabase(await applyGlobalArtworkCache(metadataTracks));
+
+  await db.transaction("rw", db.sources, db.playlists, db.tracks, db.trackFileBlobs, async () => {
+    await db.sources.put(source);
+    await db.playlists.bulkPut(playlists);
+    await db.tracks.bulkPut(tracks);
+    await db.trackFileBlobs.bulkPut(trackFileBlobs);
+  });
+
+  if (localArtworks.size > 0) {
+    for (const track of tracks) {
+      const artworkBlob = localArtworks.get(track.id);
+      if (!artworkBlob) continue;
+      await persistTrackArtwork({
+        track,
+        artworkBlob,
+        source: "LOCAL"
+      });
+    }
+  }
+
+  const persistedTracks = await db.tracks.where("sourceId").equals(sourceId).toArray();
+  return { source, playlists, tracks: await hydrateTracksWithArtworkUrls(persistedTracks) };
+};
+
+const getTopLevelFolderNameFromWebkitPath = (file: File): string | null => {
+  const normalizedPath = normalizeImportString(file.webkitRelativePath);
+  if (!normalizedPath) return null;
+
+  const segments = normalizedPath.split("/").filter(Boolean);
+  if (segments.length < 2) return null;
+  return segments[0] ?? null;
+};
+
+const groupFilesByTopLevelFolder = (files: File[]): File[][] => {
+  const groupedByFolder = new Map<string, File[]>();
+  const looseFiles: File[] = [];
+
+  for (const file of files) {
+    const folderName = getTopLevelFolderNameFromWebkitPath(file);
+    if (!folderName) {
+      looseFiles.push(file);
+      continue;
+    }
+
+    const existing = groupedByFolder.get(folderName);
+    if (existing) {
+      existing.push(file);
+    } else {
+      groupedByFolder.set(folderName, [file]);
+    }
+  }
+
+  const groups = Array.from(groupedByFolder.values());
+  if (looseFiles.length > 0) {
+    groups.push(looseFiles);
+  }
+  return groups;
+};
+
+export const importFilesBulk = async (files: File[]): Promise<{ sources: number; tracks: number }> => {
+  const audioFiles = files.filter((file) => isAudioInputFile(file));
+  if (audioFiles.length === 0) {
+    throw new Error("No supported audio files were selected");
+  }
+
+  const groupedFiles = groupFilesByTopLevelFolder(audioFiles);
+  let importedSourceCount = 0;
+  let importedTrackCount = 0;
+
+  for (const fileGroup of groupedFiles) {
+    const imported = await importFiles(fileGroup);
+    importedSourceCount += 1;
+    importedTrackCount += imported.tracks.length;
+  }
+
+  return {
+    sources: importedSourceCount,
+    tracks: importedTrackCount
+  };
+};
+
 export const refreshSource = async (sourceId: string): Promise<RefreshResult> => {
   const source = await db.sources.get(sourceId);
   if (!source) {
     throw new Error("Source not found");
+  }
+  if (source.importType === "files") {
+    throw new Error("This source was imported from files. Re-import files to refresh it.");
   }
 
   const handleRecord = await db.folderHandles.get(source.handleKey);
@@ -411,7 +714,25 @@ export const refreshSource = async (sourceId: string): Promise<RefreshResult> =>
   ]);
   const favoriteByPath = new Map(oldTracks.map((track) => [track.relativePath, track.favorite]));
   const previousTrackByPath = new Map(oldTracks.map((track) => [track.relativePath, track]));
-  const { playlists, tracks: scannedTracks } = await buildLibraryFromHandle(source.id, source.name, handleRecord.handle, favoriteByPath);
+  const { playlists: scannedPlaylists, tracks: allScannedTracks } = await buildLibraryFromHandle(
+    source.id,
+    source.name,
+    handleRecord.handle,
+    favoriteByPath
+  );
+  const ignoredRelativePaths = await getIgnoredRelativePathSetForSource(source.id);
+  const scannedTracks =
+    ignoredRelativePaths.size === 0
+      ? allScannedTracks
+      : allScannedTracks.filter((track) => !ignoredRelativePaths.has(normalizeRelativePath(track.relativePath)));
+  const scannedTrackIds = new Set(scannedTracks.map((track) => track.id));
+  const playlists = scannedPlaylists
+    .map((playlist) => ({
+      ...playlist,
+      trackIds: playlist.trackIds.filter((trackId) => scannedTrackIds.has(trackId))
+    }))
+    .filter((playlist) => playlist.trackIds.length > 0);
+
   const { tracks: metadataTracks, localArtworks } = await enrichTracksWithEmbeddedMetadata(
     handleRecord.handle,
     scannedTracks,
@@ -434,7 +755,8 @@ export const refreshSource = async (sourceId: string): Promise<RefreshResult> =>
           artworkUpdatedAt: previous.artworkUpdatedAt ?? track.artworkUpdatedAt,
           acoustIdFingerprint: previous.acoustIdFingerprint ?? track.acoustIdFingerprint,
           musicBrainzRecordingId: previous.musicBrainzRecordingId ?? track.musicBrainzRecordingId,
-          musicBrainzReleaseId: previous.musicBrainzReleaseId ?? track.musicBrainzReleaseId
+          musicBrainzReleaseId: previous.musicBrainzReleaseId ?? track.musicBrainzReleaseId,
+          durationSec: previous.durationSec ?? track.durationSec
         };
       })
     )
@@ -479,14 +801,137 @@ export const refreshSource = async (sourceId: string): Promise<RefreshResult> =>
   };
 };
 
-const clearFolderContents = async (handle: FileSystemDirectoryHandle): Promise<void> => {
-  const targets: string[] = [];
-  for await (const [name] of handle.entries()) {
-    targets.push(name);
+const isNotFoundError = (error: unknown): boolean => {
+  return error instanceof DOMException && error.name === "NotFoundError";
+};
+
+const resolveSourceHandleWithPermission = async (
+  source: LibrarySource,
+  mode: "read" | "readwrite"
+): Promise<FileSystemDirectoryHandle> => {
+  const handleRecord = await db.folderHandles.get(source.handleKey);
+  if (!handleRecord) {
+    throw new Error("Folder handle missing, re-import the folder");
   }
-  for (const name of targets) {
-    await handle.removeEntry(name, { recursive: true });
+
+  const permission = await handleRecord.handle.queryPermission({ mode });
+  if (permission !== "granted") {
+    const result = await handleRecord.handle.requestPermission({ mode });
+    if (result !== "granted") {
+      throw new Error(mode === "readwrite" ? "Folder delete permission denied" : "Read permission denied for this folder");
+    }
   }
+
+  return handleRecord.handle;
+};
+
+const splitFileName = (fileName: string): { base: string; ext: string } => {
+  const dotIndex = fileName.lastIndexOf(".");
+  if (dotIndex <= 0) {
+    return { base: fileName, ext: "" };
+  }
+  return {
+    base: fileName.slice(0, dotIndex),
+    ext: fileName.slice(dotIndex)
+  };
+};
+
+const ensureUniqueFileNameInDirectory = async (
+  directory: FileSystemDirectoryHandle,
+  fileName: string
+): Promise<string> => {
+  let candidate = fileName;
+  let suffix = 1;
+  const { base, ext } = splitFileName(fileName);
+
+  while (true) {
+    try {
+      await directory.getFileHandle(candidate);
+      candidate = `${base} (${suffix})${ext}`;
+      suffix += 1;
+    } catch (error) {
+      if (isNotFoundError(error)) {
+        return candidate;
+      }
+      throw error;
+    }
+  }
+};
+
+const moveRelativeFileToRecycleFolder = async (
+  rootHandle: FileSystemDirectoryHandle,
+  relativePath: string
+): Promise<void> => {
+  const normalized = normalizeRelativePath(relativePath);
+  if (!normalized) return;
+
+  const segments = normalized.split("/").filter(Boolean);
+  const fileName = segments.pop();
+  if (!fileName) return;
+
+  let sourceDirectory = rootHandle;
+  try {
+    for (const segment of segments) {
+      sourceDirectory = await sourceDirectory.getDirectoryHandle(segment);
+    }
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      return;
+    }
+    throw error;
+  }
+
+  let sourceFileHandle: FileSystemFileHandle;
+  try {
+    sourceFileHandle = await sourceDirectory.getFileHandle(fileName);
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      return;
+    }
+    throw error;
+  }
+
+  const recycleDirectory = await sourceDirectory.getDirectoryHandle(APP_RECYCLE_DIRECTORY_NAME, { create: true });
+  const uniqueName = await ensureUniqueFileNameInDirectory(recycleDirectory, fileName);
+  const targetHandle = await recycleDirectory.getFileHandle(uniqueName, { create: true });
+  const sourceFile = await sourceFileHandle.getFile();
+  const writable = await targetHandle.createWritable();
+  try {
+    await writable.write(sourceFile);
+  } finally {
+    await writable.close();
+  }
+
+  await sourceDirectory.removeEntry(fileName);
+};
+
+const moveTracksToRecycleFolder = async (
+  rootHandle: FileSystemDirectoryHandle,
+  tracks: Track[]
+): Promise<void> => {
+  if (tracks.length === 0) return;
+  for (const track of tracks) {
+    await moveRelativeFileToRecycleFolder(rootHandle, track.relativePath);
+  }
+};
+
+const deletePlaylistLocalContentsFromRoot = async (
+  rootHandle: FileSystemDirectoryHandle,
+  playlistTracks: Track[]
+): Promise<void> => {
+  await moveTracksToRecycleFolder(rootHandle, playlistTracks);
+};
+
+const deletePlaylistLocalContents = async (
+  source: LibrarySource,
+  playlistTracks: Track[]
+): Promise<void> => {
+  if (source.importType === "files") {
+    return;
+  }
+
+  const rootHandle = await resolveSourceHandleWithPermission(source, "readwrite");
+  await deletePlaylistLocalContentsFromRoot(rootHandle, playlistTracks);
 };
 
 export const removeSource = async (sourceId: string, mode: "unlink" | "delete"): Promise<void> => {
@@ -494,32 +939,59 @@ export const removeSource = async (sourceId: string, mode: "unlink" | "delete"):
   if (!source) return;
   const sourceTracks = await db.tracks.where("sourceId").equals(sourceId).toArray();
 
-  if (mode === "delete") {
-    const handleRecord = await db.folderHandles.get(source.handleKey);
-    if (!handleRecord) {
-      throw new Error("Cannot delete local folder because handle is unavailable");
-    }
-
-    const permission = await handleRecord.handle.queryPermission({ mode: "readwrite" });
-    if (permission !== "granted") {
-      const result = await handleRecord.handle.requestPermission({ mode: "readwrite" });
-      if (result !== "granted") {
-        throw new Error("Folder delete permission denied");
-      }
-    }
-
-    await clearFolderContents(handleRecord.handle);
+  if (mode === "delete" && source.importType !== "files") {
+    const rootHandle = await resolveSourceHandleWithPermission(source, "readwrite");
+    await moveTracksToRecycleFolder(rootHandle, sourceTracks);
   }
 
   if (sourceTracks.length > 0) {
     await removeArtworkAssociationsForTracks(sourceTracks.map((track) => track.id));
   }
 
-  await db.transaction("rw", db.sources, db.playlists, db.tracks, db.folderHandles, async () => {
+  await db.transaction("rw", [db.sources, db.playlists, db.tracks, db.folderHandles, db.trackFileBlobs], async () => {
     await db.playlists.where("sourceId").equals(sourceId).delete();
     await db.tracks.where("sourceId").equals(sourceId).delete();
     await db.sources.delete(sourceId);
     await db.folderHandles.delete(source.handleKey);
+    for (const track of sourceTracks) {
+      await db.trackFileBlobs.delete(track.id);
+    }
+  });
+};
+
+export const removePlaylist = async (playlistId: string, mode: "unlink" | "delete"): Promise<void> => {
+  const playlist = await db.playlists.get(playlistId);
+  if (!playlist) return;
+
+  const source = await db.sources.get(playlist.sourceId);
+  if (!source) {
+    throw new Error("Folder source not found");
+  }
+
+  const playlistTracks = await db.tracks.where("playlistId").equals(playlistId).toArray();
+
+  if (mode === "delete") {
+    await deletePlaylistLocalContents(source, playlistTracks);
+  }
+
+  if (playlistTracks.length > 0) {
+    await removeArtworkAssociationsForTracks(playlistTracks.map((track) => track.id));
+  }
+
+  await db.transaction("rw", [db.sources, db.playlists, db.tracks, db.folderHandles, db.trackFileBlobs], async () => {
+    await db.playlists.delete(playlistId);
+    if (playlistTracks.length > 0) {
+      await db.tracks.bulkDelete(playlistTracks.map((track) => track.id));
+      for (const track of playlistTracks) {
+        await db.trackFileBlobs.delete(track.id);
+      }
+    }
+
+    const remainingPlaylistCount = await db.playlists.where("sourceId").equals(playlist.sourceId).count();
+    if (remainingPlaylistCount === 0) {
+      await db.sources.delete(source.id);
+      await db.folderHandles.delete(source.handleKey);
+    }
   });
 };
 
@@ -558,22 +1030,60 @@ export const trashSource = async (sourceId: string): Promise<void> => {
   });
 };
 
+export const trashPlaylist = async (playlistId: string): Promise<void> => {
+  const playlist = await db.playlists.get(playlistId);
+  if (!playlist) return;
+
+  const source = await db.sources.get(playlist.sourceId);
+  if (!source) {
+    throw new Error("Folder source not found");
+  }
+
+  const tracks = await db.tracks.where("playlistId").equals(playlistId).toArray();
+  const trashedSource: TrashedSource = {
+    id: makeTrashId("playlist", playlistId),
+    source,
+    playlists: [playlist],
+    tracks,
+    trashedAt: Date.now()
+  };
+  const ignoredTrackPathRecords = buildIgnoredTrackPathRecords(tracks);
+
+  await db.transaction("rw", [db.sources, db.playlists, db.tracks, db.trashedSources, db.ignoredTrackPaths], async () => {
+    await db.trashedSources.put(trashedSource);
+    if (ignoredTrackPathRecords.length > 0) {
+      await db.ignoredTrackPaths.bulkPut(ignoredTrackPathRecords);
+    }
+    await db.playlists.delete(playlistId);
+    if (tracks.length > 0) {
+      await db.tracks.bulkDelete(tracks.map((track) => track.id));
+    }
+
+    const remainingPlaylistCount = await db.playlists.where("sourceId").equals(source.id).count();
+    if (remainingPlaylistCount === 0) {
+      await db.sources.delete(source.id);
+    }
+  });
+};
+
 export const restoreTrashedSource = async (trashId: string): Promise<void> => {
   const trashed = await db.trashedSources.get(trashId);
   if (!trashed) return;
+  const ignoredTrackPathIds = buildIgnoredTrackPathIds(trashed.tracks);
 
-  const exists = await db.sources.get(trashed.source.id);
-  if (exists) {
-    throw new Error("Cannot restore folder because it already exists in your library");
-  }
-
-  await db.transaction("rw", db.sources, db.playlists, db.tracks, db.trashedSources, async () => {
-    await db.sources.put(trashed.source);
+  await db.transaction("rw", [db.sources, db.playlists, db.tracks, db.trashedSources, db.ignoredTrackPaths], async () => {
+    const existingSource = await db.sources.get(trashed.source.id);
+    if (!existingSource) {
+      await db.sources.put(trashed.source);
+    }
     if (trashed.playlists.length > 0) {
       await db.playlists.bulkPut(trashed.playlists);
     }
     if (trashed.tracks.length > 0) {
       await db.tracks.bulkPut(trashed.tracks);
+    }
+    if (ignoredTrackPathIds.length > 0) {
+      await db.ignoredTrackPaths.bulkDelete(ignoredTrackPathIds);
     }
     await db.trashedSources.delete(trashId);
   });
@@ -619,15 +1129,19 @@ const resolveTrackParentDirectory = async (
 export const removeTrack = async (trackId: string, mode: "unlink" | "delete"): Promise<void> => {
   const track = await db.tracks.get(trackId);
   if (!track) return;
+  const source = await db.sources.get(track.sourceId);
 
-  if (mode === "delete") {
+  if (mode === "delete" && source && source.importType !== "files") {
     const { directory, fileName } = await resolveTrackParentDirectory(track.sourceId, track.relativePath, "readwrite");
     await directory.removeEntry(fileName);
     await removeArtworkAssociationsForTracks([trackId]);
+  } else {
+    await removeArtworkAssociationsForTracks([trackId]);
   }
 
-  await db.transaction("rw", db.tracks, db.playlists, async () => {
+  await db.transaction("rw", db.tracks, db.playlists, db.trackFileBlobs, async () => {
     await db.tracks.delete(trackId);
+    await db.trackFileBlobs.delete(trackId);
     const playlist = await db.playlists.get(track.playlistId);
     if (!playlist) return;
     const nextTrackIds = playlist.trackIds.filter((id) => id !== trackId);
@@ -655,9 +1169,16 @@ export const trashTrack = async (trackId: string): Promise<void> => {
     playlistName: playlist.name,
     trashedAt: Date.now()
   };
+  const ignoredTrackPathId = makeIgnoredTrackPathId(track.sourceId, track.relativePath);
 
-  await db.transaction("rw", db.tracks, db.playlists, db.trashedTracks, async () => {
+  await db.transaction("rw", db.tracks, db.playlists, db.trashedTracks, db.ignoredTrackPaths, async () => {
     await db.trashedTracks.put(trashedTrack);
+    await db.ignoredTrackPaths.put({
+      id: ignoredTrackPathId,
+      sourceId: track.sourceId,
+      relativePath: normalizeRelativePath(track.relativePath),
+      updatedAt: Date.now()
+    });
     await db.tracks.delete(trackId);
     await db.playlists.put({
       ...playlist,
@@ -676,7 +1197,7 @@ export const restoreTrashedTrack = async (trashId: string): Promise<void> => {
     throw new Error("Cannot restore track because its folder is not in the library");
   }
 
-  await db.transaction("rw", db.tracks, db.playlists, db.trashedTracks, async () => {
+  await db.transaction("rw", db.tracks, db.playlists, db.trashedTracks, db.ignoredTrackPaths, async () => {
     await db.tracks.put(trashed.track);
     if (!playlist.trackIds.includes(trashed.track.id)) {
       await db.playlists.put({
@@ -685,6 +1206,7 @@ export const restoreTrashedTrack = async (trashId: string): Promise<void> => {
         updatedAt: Date.now()
       });
     }
+    await db.ignoredTrackPaths.delete(makeIgnoredTrackPathId(trashed.track.sourceId, trashed.track.relativePath));
     await db.trashedTracks.delete(trashId);
   });
 };
@@ -699,16 +1221,165 @@ export const clearTrash = async (): Promise<void> => {
   const trackIds = Array.from(new Set([...trackIdsFromSources, ...trackIdsFromTracks]));
 
   if (trackIds.length > 0) {
-    await removeArtworkAssociationsForTracks(trackIds);
+    try {
+      await removeArtworkAssociationsForTracks(trackIds);
+    } catch (error) {
+      // Avoid UI hard-failure when clearing very large trash batches.
+      console.warn("Artwork association cleanup failed during clearTrash", error);
+    }
   }
 
-  await db.transaction("rw", db.trashedSources, db.trashedTracks, db.folderHandles, async () => {
+  const liveSourceIds = new Set((await db.sources.toArray()).map((source) => source.id));
+  const ignoredTrackRecordsToKeep: Track[] = [
+    ...trashedSources
+      .filter((entry) => liveSourceIds.has(entry.source.id))
+      .flatMap((entry) => entry.tracks),
+    ...trashedTracks
+      .filter((entry) => liveSourceIds.has(entry.track.sourceId))
+      .map((entry) => entry.track)
+  ];
+  const ignoredTrackRecordsToDrop: Track[] = [
+    ...trashedSources
+      .filter((entry) => !liveSourceIds.has(entry.source.id))
+      .flatMap((entry) => entry.tracks),
+    ...trashedTracks
+      .filter((entry) => !liveSourceIds.has(entry.track.sourceId))
+      .map((entry) => entry.track)
+  ];
+  const ignoredTrackPathRecords = buildIgnoredTrackPathRecords(ignoredTrackRecordsToKeep);
+  const ignoredTrackPathIdsToDrop = buildIgnoredTrackPathIds(ignoredTrackRecordsToDrop);
+
+  await db.transaction("rw", [db.sources, db.trashedSources, db.trashedTracks, db.folderHandles, db.trackFileBlobs, db.ignoredTrackPaths], async () => {
+    if (ignoredTrackPathRecords.length > 0) {
+      await db.ignoredTrackPaths.bulkPut(ignoredTrackPathRecords);
+    }
+    if (ignoredTrackPathIdsToDrop.length > 0) {
+      await db.ignoredTrackPaths.bulkDelete(ignoredTrackPathIdsToDrop);
+    }
     await db.trashedSources.clear();
     await db.trashedTracks.clear();
     for (const entry of trashedSources) {
-      await db.folderHandles.delete(entry.source.handleKey);
+      const sourceStillExists = await db.sources.get(entry.source.id);
+      if (!sourceStillExists) {
+        await db.folderHandles.delete(entry.source.handleKey);
+      }
+    }
+    for (const chunk of chunkArray(trackIds, DELETE_CHUNK_SIZE)) {
+      await db.trackFileBlobs.bulkDelete(chunk);
     }
   });
+};
+
+const APP_DATA_CLEAR_TARGETS = new Set<AppDataClearTarget>([
+  "favorites",
+  "song_images",
+  "songs_playlists",
+  "trash",
+  "metadata_cache"
+]);
+
+const normalizeClearAppDataTargets = (targets: AppDataClearTarget[]): AppDataClearTarget[] => {
+  const unique: AppDataClearTarget[] = [];
+  for (const target of targets) {
+    if (!APP_DATA_CLEAR_TARGETS.has(target)) continue;
+    if (!unique.includes(target)) {
+      unique.push(target);
+    }
+  }
+  return unique;
+};
+
+export const clearSelectedAppData = async (targets: AppDataClearTarget[]): Promise<void> => {
+  const normalizedTargets = normalizeClearAppDataTargets(targets);
+  if (normalizedTargets.length === 0) return;
+
+  const selected = new Set(normalizedTargets);
+  const clearSongsAndPlaylists = selected.has("songs_playlists");
+  const clearSongImagesOnly = selected.has("song_images") && !clearSongsAndPlaylists;
+  const clearFavoritesOnly = selected.has("favorites") && !clearSongsAndPlaylists;
+  const clearTrashSelection = selected.has("trash");
+  const clearMetadataCache = selected.has("metadata_cache");
+  const retainTrashRestoreData = clearSongsAndPlaylists && !clearTrashSelection;
+  const now = Date.now();
+
+  if (clearTrashSelection) {
+    await clearTrash();
+  }
+
+  if (clearFavoritesOnly) {
+    await db.tracks.toCollection().modify((track) => {
+      if (!track.favorite) return;
+      track.favorite = false;
+      track.updatedAt = now;
+    });
+  }
+
+  if (clearSongImagesOnly) {
+    await db.transaction(
+      "rw",
+      [db.tracks, db.trackArtworks, db.entityArtworks, db.artworks, db.artworkFullBlobs, db.artworkCache],
+      async () => {
+        await db.tracks.toCollection().modify((track) => {
+          track.artworkId = undefined;
+          track.artworkSource = undefined;
+          track.artworkPath = undefined;
+          track.artworkOptimizedPath = undefined;
+          track.artworkUpdatedAt = now;
+          track.artworkUrl = undefined;
+          track.artworkCandidateUrl = undefined;
+          track.isDefaultArtwork = true;
+          track.updatedAt = now;
+        });
+        await db.trackArtworks.clear();
+        await db.entityArtworks.clear();
+        await db.artworks.clear();
+        await db.artworkFullBlobs.clear();
+        await db.artworkCache.clear();
+      }
+    );
+    failedArtworkUrls.clear();
+  }
+
+  if (clearSongsAndPlaylists) {
+    await db.transaction(
+      "rw",
+      [
+        db.sources,
+        db.playlists,
+        db.tracks,
+        db.folderHandles,
+        db.trackFileBlobs,
+        db.ignoredTrackPaths,
+        db.trackArtworks,
+        db.entityArtworks,
+        db.artworks,
+        db.artworkFullBlobs
+      ],
+      async () => {
+        await db.sources.clear();
+        await db.playlists.clear();
+        await db.tracks.clear();
+        if (!retainTrashRestoreData) {
+          await db.folderHandles.clear();
+          await db.trackFileBlobs.clear();
+          await db.ignoredTrackPaths.clear();
+        }
+        await db.trackArtworks.clear();
+        await db.entityArtworks.clear();
+        await db.artworks.clear();
+        await db.artworkFullBlobs.clear();
+      }
+    );
+    failedArtworkUrls.clear();
+  }
+
+  if (clearMetadataCache) {
+    await db.transaction("rw", [db.artworkCache, db.metadataHitCache], async () => {
+      await db.artworkCache.clear();
+      await db.metadataHitCache.clear();
+    });
+    failedArtworkUrls.clear();
+  }
 };
 
 export const reorderSourcePlaylists = async (sourceId: string, orderedPlaylistIds: string[]): Promise<void> => {
@@ -760,10 +1431,66 @@ export const searchTracks = (tracks: Track[], query: string): Track[] => {
   });
 };
 
+const resolveTrackFileFromBlobStore = async (track: Track): Promise<File | null> => {
+  const blobRecord = await db.trackFileBlobs.get(track.id);
+  if (!blobRecord?.fileBlob) {
+    return null;
+  }
+
+  return new File([blobRecord.fileBlob], track.fileName, {
+    type: blobRecord.fileBlob.type || "application/octet-stream",
+    lastModified: blobRecord.updatedAt
+  });
+};
+
 export const resolveTrackFile = async (track: Track): Promise<File> => {
-  const { directory, fileName } = await resolveTrackParentDirectory(track.sourceId, track.relativePath, "read");
-  const fileHandle = await directory.getFileHandle(fileName);
-  return fileHandle.getFile();
+  const source = await db.sources.get(track.sourceId);
+  if (!source) {
+    throw new Error("Track source not found");
+  }
+
+  if (source.importType === "files") {
+    const stored = await resolveTrackFileFromBlobStore(track);
+    if (stored) return stored;
+    throw new Error("Track file is unavailable. Re-import this file source.");
+  }
+
+  try {
+    const { directory, fileName } = await resolveTrackParentDirectory(track.sourceId, track.relativePath, "read");
+    const fileHandle = await directory.getFileHandle(fileName);
+    return fileHandle.getFile();
+  } catch {
+    const stored = await resolveTrackFileFromBlobStore(track);
+    if (stored) return stored;
+    throw new Error("Unable to read this track file");
+  }
+};
+
+export const ensureTrackDuration = async (trackId: string): Promise<number | null> => {
+  const track = await db.tracks.get(trackId);
+  if (!track) return null;
+
+  const existingDuration = track.durationSec;
+  if (typeof existingDuration === "number" && Number.isFinite(existingDuration) && existingDuration > 0) {
+    return existingDuration;
+  }
+
+  try {
+    const file = await resolveTrackFile(track);
+    const parsedMetadata = await parseAudioFileMetadata(file);
+    const parsedDuration = parsedMetadata.durationSec;
+    if (!(typeof parsedDuration === "number" && Number.isFinite(parsedDuration) && parsedDuration > 0)) {
+      return null;
+    }
+
+    await db.tracks.update(trackId, {
+      durationSec: parsedDuration,
+      updatedAt: Date.now()
+    });
+    return parsedDuration;
+  } catch {
+    return null;
+  }
 };
 
 interface ArtworkLookupResult {
@@ -775,6 +1502,8 @@ interface ArtworkLookupResult {
 }
 
 const failedArtworkUrls = new Set<string>();
+const LOW_RES_REMOTE_ARTWORK_UPGRADE_ATTEMPTS = new Set<string>();
+const REMOTE_ARTWORK_MIN_EDGE_PX = 320;
 
 const normalizeForMatch = (value?: string): string => {
   return value?.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim() ?? "";
@@ -796,6 +1525,122 @@ const sanitizeLookupArtist = (artist?: string): string | undefined => {
 const normalizeArtworkCandidate = (url?: string): string | undefined => {
   const normalized = url?.trim();
   return normalized ? normalized : undefined;
+};
+
+const extractArtworkSizeHint = (url: string): number => {
+  const normalized = url.toLowerCase();
+  let bestEdge = 0;
+
+  for (const match of normalized.matchAll(/(\d{2,5})x(\d{2,5})/g)) {
+    const width = Number.parseInt(match[1], 10);
+    const height = Number.parseInt(match[2], 10);
+    if (!Number.isFinite(width) || !Number.isFinite(height)) continue;
+    bestEdge = Math.max(bestEdge, width, height);
+  }
+
+  if (normalized.includes("cover_xl")) bestEdge = Math.max(bestEdge, 1000);
+  if (normalized.includes("cover_big")) bestEdge = Math.max(bestEdge, 500);
+  if (normalized.includes("/large")) bestEdge = Math.max(bestEdge, 900);
+  if (normalized.includes("/original")) bestEdge = Math.max(bestEdge, 1400);
+  return bestEdge;
+};
+
+const scoreArtworkCandidateUrl = (url: string): number => {
+  const normalized = url.toLowerCase();
+  let score = extractArtworkSizeHint(normalized);
+
+  if (normalized.includes("thumbnail")) score -= 250;
+  if (normalized.includes("thumb")) score -= 200;
+  if (normalized.includes("small")) score -= 150;
+  if (normalized.includes("tiny")) score -= 150;
+  if (normalized.includes("cover_small")) score -= 120;
+  if (normalized.includes("100x100")) score -= 220;
+
+  return score;
+};
+
+const expandArtworkCandidateVariants = (url: string): string[] => {
+  const normalized = normalizeArtworkCandidate(url);
+  if (!normalized) return [];
+
+  const variants = new Set<string>();
+  variants.add(normalized);
+
+  if (/itunes\.apple\.com|mzstatic\.com/i.test(normalized)) {
+    variants.add(normalized.replace(/(\d{2,5})x(\d{2,5})(bb|cc|sr|sc)?/i, "1400x1400bb"));
+    variants.add(normalized.replace(/(\d{2,5})x(\d{2,5})(bb|cc|sr|sc)?/i, "1200x1200bb"));
+    variants.add(normalized.replace(/(\d{2,5})x(\d{2,5})(bb|cc|sr|sc)?/i, "1000x1000bb"));
+  }
+
+  if (/deezer\./i.test(normalized)) {
+    variants.add(normalized.replace(/cover(?:_small|_medium|_big|_xl)?/i, "cover_xl"));
+  }
+
+  const sizeMatch = normalized.match(/(\d{2,5})x(\d{2,5})/i);
+  if (sizeMatch) {
+    const currentEdge = Math.max(Number.parseInt(sizeMatch[1], 10), Number.parseInt(sizeMatch[2], 10));
+    for (const target of [1400, 1200, 1000, 800, 600, 500]) {
+      if (!Number.isFinite(currentEdge) || target <= currentEdge) continue;
+      variants.add(normalized.replace(/(\d{2,5})x(\d{2,5})/i, `${target}x${target}`));
+    }
+  }
+
+  return Array.from(variants);
+};
+
+const buildPrioritizedArtworkCandidates = (candidates: Array<string | undefined>): string[] => {
+  const ranked: Array<{ url: string; score: number; index: number }> = [];
+  const seen = new Set<string>();
+  let index = 0;
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    for (const variant of expandArtworkCandidateVariants(candidate)) {
+      const normalized = normalizeArtworkCandidate(variant);
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      ranked.push({
+        url: normalized,
+        score: scoreArtworkCandidateUrl(normalized),
+        index
+      });
+      index += 1;
+    }
+  }
+
+  ranked.sort((a, b) => b.score - a.score || a.index - b.index);
+  return ranked.map((entry) => entry.url);
+};
+
+const pickBestArtworkCandidate = (candidates: Array<string | undefined>): string | undefined => {
+  return buildPrioritizedArtworkCandidates(candidates).find((candidate) => !isFailedArtworkUrl(candidate));
+};
+
+const getArtworkBlobMaxEdge = async (blob: Blob): Promise<number | null> => {
+  try {
+    if (typeof createImageBitmap === "function") {
+      const bitmap = await createImageBitmap(blob);
+      const maxEdge = Math.max(bitmap.width, bitmap.height);
+      bitmap.close();
+      return maxEdge > 0 ? maxEdge : null;
+    }
+
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+      const image = new Image();
+      await new Promise<void>((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () => reject(new Error("Failed to decode artwork image"));
+        image.src = objectUrl;
+      });
+      const maxEdge = Math.max(image.naturalWidth, image.naturalHeight);
+      return maxEdge > 0 ? maxEdge : null;
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+    }
+  } catch {
+    return null;
+  }
 };
 
 const markArtworkUrlAsFailed = (url?: string): void => {
@@ -892,7 +1737,7 @@ const applyOfflineArtworkDatabase = async (tracks: Track[]): Promise<Track[]> =>
       if (!matched) return track;
 
       const nextAlbum = matched.album?.trim() || track.album;
-      const nextArtworkCandidate = matched.artworkUrl?.trim() || track.artworkCandidateUrl;
+      const nextArtworkCandidate = pickBestArtworkCandidate([matched.artworkUrl, track.artworkCandidateUrl]);
       const nextRecordingId = matched.musicBrainzRecordingId?.trim() || track.musicBrainzRecordingId;
       const nextReleaseId = matched.musicBrainzReleaseId?.trim() || track.musicBrainzReleaseId;
 
@@ -934,202 +1779,10 @@ const throwIfAborted = (signal?: AbortSignal): void => {
   }
 };
 
-const blobToDataUrl = (blob: Blob): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === "string") {
-        resolve(reader.result);
-      } else {
-        reject(new Error("Unable to read artwork data"));
-      }
-    };
-    reader.onerror = () => reject(reader.error ?? new Error("Unable to read artwork data"));
-    reader.readAsDataURL(blob);
-  });
-};
-
 const normalizeImportString = (value: unknown): string | undefined => {
   if (typeof value !== "string") return undefined;
   const cleaned = value.trim();
   return cleaned || undefined;
-};
-
-const escapeRegExp = (value: string): string => {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-};
-
-const stripTrailingArtistFromTitle = (title?: string, artist?: string): string | undefined => {
-  const cleanedTitle = normalizeImportString(title);
-  if (!cleanedTitle) return undefined;
-  const cleanedArtist = normalizeImportString(artist);
-  if (!cleanedArtist) return cleanedTitle;
-
-  const withoutArtist = cleanedTitle.replace(
-    new RegExp(`\\s*[-–—:|,]*\\s*${escapeRegExp(cleanedArtist)}\\s*$`, "i"),
-    ""
-  );
-  const normalizedWithoutArtist = normalizeImportString(withoutArtist);
-  return normalizedWithoutArtist || cleanedTitle;
-};
-
-const stripTitleQualifiers = (title?: string): string | undefined => {
-  const cleanedTitle = normalizeImportString(title);
-  if (!cleanedTitle) return undefined;
-
-  const qualifierPattern =
-    /(feat|featuring|ft|live|radio|studio|version|edit|acoustic|mix|remaster|performance|background vocals|collab|alternate)/i;
-
-  let next = cleanedTitle
-    .replace(/[_/]+/g, " ")
-    .replace(/\(([^)]*)\)/g, (full, content: string) => (qualifierPattern.test(content) ? "" : full))
-    .replace(/\[([^\]]*)\]/g, (full, content: string) => (qualifierPattern.test(content) ? "" : full))
-    .replace(/\b(feat\.?|featuring|ft\.?)\b.*$/i, "")
-    .replace(
-      /\b(live|radio version|radio edit|studio version|acoustic|collab version|alternate version|performance track|no background vocals)\b/gi,
-      ""
-    )
-    .replace(/\s+/g, " ")
-    .trim();
-
-  const normalized = normalizeImportString(next);
-  return normalized || cleanedTitle;
-};
-
-const tokenOverlapRatio = (left: string, right: string): number => {
-  if (!left || !right) return 0;
-  const leftTokens = new Set(left.split(" ").filter(Boolean));
-  const rightTokens = new Set(right.split(" ").filter(Boolean));
-  if (leftTokens.size === 0 || rightTokens.size === 0) return 0;
-
-  let shared = 0;
-  for (const token of leftTokens) {
-    if (rightTokens.has(token)) {
-      shared += 1;
-    }
-  }
-  const denominator = Math.min(leftTokens.size, rightTokens.size);
-  return denominator > 0 ? shared / denominator : 0;
-};
-
-const buildImportTitleVariants = (title?: string, artist?: string): string[] => {
-  const variants = new Set<string>();
-  const cleanedTitle = normalizeImportString(title);
-  if (!cleanedTitle) return [];
-  variants.add(cleanedTitle);
-
-  const withoutArtist = stripTrailingArtistFromTitle(cleanedTitle, artist);
-  if (withoutArtist) {
-    variants.add(withoutArtist);
-  }
-
-  const withoutQualifiers = stripTitleQualifiers(withoutArtist ?? cleanedTitle);
-  if (withoutQualifiers) {
-    variants.add(withoutQualifiers);
-  }
-
-  return Array.from(variants);
-};
-
-const upsertArtworkCacheByKey = (
-  byKey: Map<string, PendingArtworkCacheEntry>,
-  key: string,
-  album?: string,
-  artworkUrl?: string
-): void => {
-  const normalizedAlbum = normalizeImportString(album);
-  const normalizedArtwork = normalizeImportString(artworkUrl);
-  if (!normalizedAlbum && !normalizedArtwork) return;
-
-  const existing = byKey.get(key);
-  if (!existing) {
-    byKey.set(key, {
-      album: normalizedAlbum,
-      artworkUrl: normalizedArtwork
-    });
-    return;
-  }
-
-  if (!existing.album?.trim() && normalizedAlbum) {
-    existing.album = normalizedAlbum;
-  }
-  if (!existing.artworkUrl?.trim() && normalizedArtwork) {
-    existing.artworkUrl = normalizedArtwork;
-  }
-};
-
-const scoreImportedCandidateForTrack = (track: Track, candidate: ImportedCoverCandidate): number => {
-  const trackTitle = normalizeForMatch(track.name);
-  const trackCanonical = normalizeForMatch(stripTitleQualifiers(track.name) ?? track.name);
-  if (!trackTitle && !trackCanonical) return -1;
-
-  let score = 0;
-  if (trackTitle && candidate.normalizedTitle) {
-    if (trackTitle === candidate.normalizedTitle) {
-      score += 8;
-    } else if (trackTitle.includes(candidate.normalizedTitle) || candidate.normalizedTitle.includes(trackTitle)) {
-      score += 5;
-    }
-  }
-
-  if (trackCanonical && candidate.canonicalTitle) {
-    if (trackCanonical === candidate.canonicalTitle) {
-      score += 7;
-    } else if (trackCanonical.includes(candidate.canonicalTitle) || candidate.canonicalTitle.includes(trackCanonical)) {
-      score += 4;
-    } else if (tokenOverlapRatio(trackCanonical, candidate.canonicalTitle) >= 0.75) {
-      score += 2;
-    }
-  }
-
-  if (candidate.artworkUrl?.startsWith("data:")) {
-    score += 1;
-  }
-  return score;
-};
-
-const findBestImportedCandidateForTrack = (
-  track: Track,
-  candidates: ImportedCoverCandidate[]
-): ImportedCoverCandidate | null => {
-  let bestCandidate: ImportedCoverCandidate | null = null;
-  let bestScore = -1;
-
-  for (const candidate of candidates) {
-    const score = scoreImportedCandidateForTrack(track, candidate);
-    if (score > bestScore) {
-      bestScore = score;
-      bestCandidate = candidate;
-    }
-  }
-
-  return bestScore >= 7 ? bestCandidate : null;
-};
-
-const asExportedPlaylistPayload = (value: unknown): ExportedPlaylistPayload | null => {
-  if (!value || typeof value !== "object") return null;
-  return value as ExportedPlaylistPayload;
-};
-
-const scanForPlaylistJsonFiles = async (
-  directory: FileSystemDirectoryHandle
-): Promise<ExportedPlaylistJsonFile[]> => {
-  const files: ExportedPlaylistJsonFile[] = [];
-  for await (const [name, handle] of directory.entries()) {
-    if (handle.kind === "file" && name.toLowerCase().endsWith(".json")) {
-      files.push({
-        directory,
-        fileName: name
-      });
-      continue;
-    }
-
-    if (handle.kind === "directory") {
-      const nested = await scanForPlaylistJsonFiles(handle as FileSystemDirectoryHandle);
-      files.push(...nested);
-    }
-  }
-  return files;
 };
 
 const resolveFileHandleByRelativePath = async (
@@ -1151,229 +1804,69 @@ const resolveFileHandleByRelativePath = async (
   }
 };
 
-const resolveArtworkFileFromExport = async (
-  jsonDirectory: FileSystemDirectoryHandle,
-  artworkFileName: string
-): Promise<File | null> => {
-  const cleanedArtworkFile = artworkFileName.trim();
-  if (!cleanedArtworkFile) return null;
-
-  const candidates = new Set<string>([cleanedArtworkFile]);
-  if (!cleanedArtworkFile.includes("/") && !cleanedArtworkFile.includes("\\")) {
-    candidates.add(`covers/${cleanedArtworkFile}`);
-  }
-
-  for (const candidate of candidates) {
-    const handle = await resolveFileHandleByRelativePath(jsonDirectory, candidate);
-    if (!handle) continue;
-    try {
-      return await handle.getFile();
-    } catch {
-      // Continue trying candidate paths.
-    }
-  }
-
-  return null;
-};
-
-const isLikelyImageFile = (file: File, fileName: string): boolean => {
-  const mime = file.type?.toLowerCase().trim();
-  if (mime.startsWith("image/")) {
-    return true;
-  }
-
-  const ext = fileName.split(".").pop()?.toLowerCase();
-  if (!ext) return false;
-  return new Set(["jpg", "jpeg", "png", "webp", "gif", "bmp", "avif", "heic", "heif"]).has(ext);
-};
-
-export const importCoverExportsFolder = async (): Promise<CoverDatabaseImportResult> => {
-  const rootHandle = await window.showDirectoryPicker({ mode: "read" });
-  const jsonFiles = await scanForPlaylistJsonFiles(rootHandle);
-  if (jsonFiles.length === 0) {
-    throw new Error("No playlist JSON files were found in this folder");
-  }
-
-  const byKey = new Map<string, PendingArtworkCacheEntry>();
-  const importedCandidates: ImportedCoverCandidate[] = [];
-  const artworkFileCache = new Map<string, string | null>();
-  let playlistFiles = 0;
-  let coversResolved = 0;
-  let coversMissing = 0;
-
-  for (const jsonFile of jsonFiles) {
-    let payload: ExportedPlaylistPayload | null = null;
-
-    try {
-      const handle = await jsonFile.directory.getFileHandle(jsonFile.fileName);
-      const file = await handle.getFile();
-      payload = asExportedPlaylistPayload(JSON.parse(await file.text()));
-    } catch {
-      continue;
-    }
-
-    if (!payload?.tracks || !Array.isArray(payload.tracks)) {
-      continue;
-    }
-
-    playlistFiles += 1;
-    for (const track of payload.tracks) {
-      const rawTitle = normalizeImportString(track?.title);
-      if (!rawTitle) continue;
-      const artist = normalizeImportString(track?.artist);
-      const album = normalizeImportString(track?.album);
-      const titleForMatch = stripTrailingArtistFromTitle(rawTitle, artist) ?? rawTitle;
-      const titleVariants = buildImportTitleVariants(rawTitle, artist);
-
-      const artworkFile = normalizeImportString(track?.artworkFile);
-      const artworkUrl = normalizeImportString(track?.artworkUrl);
-
-      let resolvedArtworkUrl: string | undefined;
-      if (artworkFile) {
-        const cacheKey = `${jsonFile.fileName}::${artworkFile}`;
-        if (artworkFileCache.has(cacheKey)) {
-          const cached = artworkFileCache.get(cacheKey);
-          if (cached) {
-            resolvedArtworkUrl = cached;
-          }
-        } else {
-          const coverFile = await resolveArtworkFileFromExport(jsonFile.directory, artworkFile);
-          if (coverFile) {
-            if (isLikelyImageFile(coverFile, artworkFile)) {
-              const dataUrl = await blobToDataUrl(coverFile);
-              artworkFileCache.set(cacheKey, dataUrl);
-              resolvedArtworkUrl = dataUrl;
-              coversResolved += 1;
-            } else {
-              artworkFileCache.set(cacheKey, null);
-              coversMissing += 1;
-            }
-          } else {
-            artworkFileCache.set(cacheKey, null);
-            coversMissing += 1;
-          }
-        }
-      }
-
-      if (!resolvedArtworkUrl && artworkUrl) {
-        resolvedArtworkUrl = artworkUrl;
-      }
-
-      if (!album && !resolvedArtworkUrl) {
-        continue;
-      }
-
-      for (const titleVariant of titleVariants) {
-        const key = buildArtworkCacheKey(titleVariant, artist);
-        if (!key) continue;
-        upsertArtworkCacheByKey(byKey, key, album, resolvedArtworkUrl);
-      }
-
-      importedCandidates.push({
-        title: titleForMatch,
-        artist,
-        album,
-        artworkUrl: resolvedArtworkUrl,
-        normalizedTitle: normalizeForMatch(titleForMatch),
-        canonicalTitle: normalizeForMatch(stripTitleQualifiers(titleForMatch) ?? titleForMatch)
-      });
-    }
-  }
-
-  if (playlistFiles === 0) {
-    throw new Error("No valid playlist export JSON was found");
-  }
-
-  const existingTracks = await db.tracks.toArray();
-  for (const track of existingTracks) {
-    const localKey = buildArtworkCacheKey(track.name, track.artist);
-    if (!localKey || byKey.has(localKey)) continue;
-    const matched = findBestImportedCandidateForTrack(track, importedCandidates);
-    if (!matched) continue;
-    upsertArtworkCacheByKey(byKey, localKey, matched.album, matched.artworkUrl);
-  }
-
-  const now = Date.now();
-  const entries: ArtworkCacheEntry[] = Array.from(byKey.entries())
-    .map(([key, value]) => ({
-      key,
-      album: value.album?.trim() || undefined,
-      artworkUrl: value.artworkUrl?.trim() || undefined,
-      updatedAt: now
-    }))
-    .filter((entry) => Boolean(entry.album || entry.artworkUrl));
-
-  if (entries.length === 0) {
-    throw new Error("No usable cover mappings were found in the selected folder");
-  }
-
-  await db.artworkCache.bulkPut(entries);
-
-  const withCacheApplied = await applyGlobalArtworkCache(existingTracks);
-  const updatedTracks: Track[] = [];
-
-  for (let index = 0; index < withCacheApplied.length; index += 1) {
-    const currentTrack = existingTracks[index];
-    const nextTrack = withCacheApplied[index];
-    const changed =
-      currentTrack.album !== nextTrack.album ||
-      currentTrack.artworkCandidateUrl !== nextTrack.artworkCandidateUrl;
-    if (!changed) continue;
-    updatedTracks.push({
-      ...nextTrack,
-      updatedAt: now
-    });
-  }
-
-  if (updatedTracks.length > 0) {
-    await db.tracks.bulkPut(updatedTracks);
-  }
-
-  return {
-    playlistFiles,
-    cacheEntries: entries.length,
-    tracksUpdated: updatedTracks.length,
-    coversResolved,
-    coversMissing
-  };
-};
-
 const pickBestMetadataHit = (hits: SongMetadataResultFromInternet[]): SongMetadataResultFromInternet | null => {
   if (hits.length === 0) return null;
-  const withArtwork = hits.find((hit) =>
-    hit.artworkPaths.some((path) => Boolean(normalizeArtworkCandidate(path)))
-  );
-  if (withArtwork) return withArtwork;
+
+  let bestWithArtwork: SongMetadataResultFromInternet | null = null;
+  let bestArtworkScore = Number.NEGATIVE_INFINITY;
+
+  for (const hit of hits) {
+    const candidate = buildPrioritizedArtworkCandidates(hit.artworkPaths)[0];
+    if (!candidate) continue;
+    const score = scoreArtworkCandidateUrl(candidate);
+    if (!bestWithArtwork || score > bestArtworkScore) {
+      bestWithArtwork = hit;
+      bestArtworkScore = score;
+    }
+  }
+
+  if (bestWithArtwork) return bestWithArtwork;
   return hits[0];
 };
 
 const persistCandidateArtworkForTrack = async (
   track: Track,
   artworkCandidateUrl?: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  options?: { fallbackCandidates?: string[]; minEdgePx?: number }
 ): Promise<Track | null> => {
-  const candidateUrl = normalizeArtworkCandidate(artworkCandidateUrl);
-  if (!candidateUrl) return null;
-  if (isFailedArtworkUrl(candidateUrl)) return null;
+  const candidateUrls = buildPrioritizedArtworkCandidates([
+    artworkCandidateUrl,
+    ...(options?.fallbackCandidates ?? [])
+  ]);
+  if (candidateUrls.length === 0) return null;
 
-  throwIfAborted(signal);
-  const artworkBlob = await fetchArtworkBlobFromUrl(candidateUrl, signal);
-  if (!artworkBlob) {
-    markArtworkUrlAsFailed(candidateUrl);
-    return null;
+  for (const candidateUrl of candidateUrls) {
+    if (isFailedArtworkUrl(candidateUrl)) continue;
+
+    throwIfAborted(signal);
+    const artworkBlob = await fetchArtworkBlobFromUrl(candidateUrl, signal);
+    if (!artworkBlob) {
+      markArtworkUrlAsFailed(candidateUrl);
+      continue;
+    }
+
+    if (typeof options?.minEdgePx === "number") {
+      const maxEdge = await getArtworkBlobMaxEdge(artworkBlob);
+      if (typeof maxEdge === "number" && maxEdge < options.minEdgePx) {
+        continue;
+      }
+    }
+
+    const persisted = await persistTrackArtwork({
+      track: {
+        ...track,
+        artworkCandidateUrl: candidateUrl
+      },
+      artworkBlob,
+      source: "REMOTE"
+    });
+
+    await writeArtworkCache(persisted, persisted.album, candidateUrl);
+    return persisted;
   }
 
-  const persisted = await persistTrackArtwork({
-    track: {
-      ...track,
-      artworkCandidateUrl: candidateUrl
-    },
-    artworkBlob,
-    source: "REMOTE"
-  });
-
-  await writeArtworkCache(persisted, persisted.album, candidateUrl);
-  return persisted;
+  return null;
 };
 
 const resolveArtworkWithFallbacks = async (track: Track, signal?: AbortSignal): Promise<ArtworkLookupResult | null> => {
@@ -1381,14 +1874,7 @@ const resolveArtworkWithFallbacks = async (track: Track, signal?: AbortSignal): 
 
   const localDbMatch = await resolveArtworkFromLocalDatabase(track);
   if (localDbMatch) {
-    const candidate = normalizeArtworkCandidate(localDbMatch.artworkUrl);
-    if (candidate && isFailedArtworkUrl(candidate)) {
-      return {
-        album: localDbMatch.album?.trim() || track.album,
-        musicBrainzRecordingId: localDbMatch.musicBrainzRecordingId?.trim() || track.musicBrainzRecordingId,
-        musicBrainzReleaseId: localDbMatch.musicBrainzReleaseId?.trim() || track.musicBrainzReleaseId
-      };
-    }
+    const candidate = pickBestArtworkCandidate([localDbMatch.artworkUrl, track.artworkCandidateUrl]);
 
     return {
       album: localDbMatch.album?.trim() || track.album,
@@ -1402,9 +1888,7 @@ const resolveArtworkWithFallbacks = async (track: Track, signal?: AbortSignal): 
   const bestHit = pickBestMetadataHit(hits);
   if (!bestHit) return null;
 
-  const candidate = bestHit.artworkPaths
-    .map((path) => normalizeArtworkCandidate(path))
-    .find((path): path is string => Boolean(path) && !isFailedArtworkUrl(path));
+  const candidate = pickBestArtworkCandidate(bestHit.artworkPaths);
 
   return {
     album: bestHit.album?.trim() || track.album,
@@ -1434,8 +1918,30 @@ export const ensureTrackMetadata = async (
   }
 
   if (workingTrack.artworkId) {
+    const existingArtworkRecord = await db.artworks.get(workingTrack.artworkId);
     const hydratedWithLocalArtwork = await hydrateTrackWithArtworkUrl(workingTrack);
     if (!hydratedWithLocalArtwork.isDefaultArtwork) {
+      const existingMaxEdge = Math.max(existingArtworkRecord?.width ?? 0, existingArtworkRecord?.height ?? 0);
+      const shouldAttemptUpgrade =
+        Boolean(workingTrack.artworkCandidateUrl) &&
+        existingArtworkRecord?.source === "REMOTE" &&
+        existingMaxEdge > 0 &&
+        existingMaxEdge < REMOTE_ARTWORK_MIN_EDGE_PX &&
+        !LOW_RES_REMOTE_ARTWORK_UPGRADE_ATTEMPTS.has(workingTrack.id);
+
+      if (shouldAttemptUpgrade) {
+        LOW_RES_REMOTE_ARTWORK_UPGRADE_ATTEMPTS.add(workingTrack.id);
+        const upgradedArtwork = await persistCandidateArtworkForTrack(
+          workingTrack,
+          workingTrack.artworkCandidateUrl,
+          signal,
+          { minEdgePx: Math.max(REMOTE_ARTWORK_MIN_EDGE_PX, existingMaxEdge + 1) }
+        );
+        if (upgradedArtwork) {
+          return upgradedArtwork;
+        }
+      }
+
       return hydratedWithLocalArtwork;
     }
 
@@ -1458,9 +1964,7 @@ export const ensureTrackMetadata = async (
     const cached = await readArtworkCache(workingTrack);
     if (cached) {
       const cachedAlbum = cached.album?.trim() || workingTrack.album;
-      const cachedCandidate =
-        normalizeArtworkCandidate(cached.artworkUrl) ||
-        normalizeArtworkCandidate(workingTrack.artworkCandidateUrl);
+      const cachedCandidate = pickBestArtworkCandidate([cached.artworkUrl, workingTrack.artworkCandidateUrl]);
 
       const changedFromCache =
         cachedAlbum !== workingTrack.album ||
@@ -1492,9 +1996,7 @@ export const ensureTrackMetadata = async (
     }
 
     const nextAlbum = resolved.album?.trim() || workingTrack.album;
-    const nextCandidateArtwork =
-      normalizeArtworkCandidate(resolved.artworkUrl) ||
-      normalizeArtworkCandidate(workingTrack.artworkCandidateUrl);
+    const nextCandidateArtwork = pickBestArtworkCandidate([resolved.artworkUrl, workingTrack.artworkCandidateUrl]);
     const nextRecordingId =
       resolved.musicBrainzRecordingId?.trim() || workingTrack.musicBrainzRecordingId;
     const nextReleaseId =

@@ -1,4 +1,4 @@
-import { Globe2, Heart, MoreVertical, Search, Trash2 } from "lucide-react";
+import { Database, Globe2, Heart, MoreVertical, Search, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 interface TopBarProps {
@@ -9,9 +9,7 @@ interface TopBarProps {
   searchEverywhere: boolean;
   onToggleSearchEverywhere: () => void;
   onOpenTrash: () => void;
-  artworkPercent: number;
-  artworkRemaining: number;
-  artworkTotal: number;
+  onOpenClearAppData: () => void;
 }
 
 export const TopBar = ({
@@ -22,9 +20,7 @@ export const TopBar = ({
   searchEverywhere,
   onToggleSearchEverywhere,
   onOpenTrash,
-  artworkPercent,
-  artworkRemaining,
-  artworkTotal
+  onOpenClearAppData
 }: TopBarProps): JSX.Element => {
   const showSearchEverywhere = tab === "library" && query.trim().length > 0;
   const [menuOpen, setMenuOpen] = useState(false);
@@ -87,7 +83,6 @@ export const TopBar = ({
           </button>
           {menuOpen ? (
             <div className="menu-popup glass">
-              {artworkTotal > 0 ? <div className="menu-status">Covers {artworkPercent}% ({artworkRemaining} left)</div> : null}
               <button
                 className="menu-item-btn"
                 onClick={() => {
@@ -97,6 +92,16 @@ export const TopBar = ({
               >
                 <Trash2 size={15} />
                 Open trash
+              </button>
+              <button
+                className="menu-item-btn danger"
+                onClick={() => {
+                  onOpenClearAppData();
+                  setMenuOpen(false);
+                }}
+              >
+                <Database size={15} />
+                Clear app data
               </button>
             </div>
           ) : null}

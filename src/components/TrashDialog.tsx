@@ -37,7 +37,7 @@ export const TrashDialog = ({
               {trashedSources.map((item) => (
                 <div key={item.id} className="trash-row">
                   <div className="trash-meta">
-                    <strong>{item.source.name}</strong>
+                    <strong>{item.playlists.length === 1 ? item.playlists[0].name : item.source.name}</strong>
                     <span>{item.tracks.length} songs</span>
                   </div>
                   <button className="icon-btn trash-restore-btn" onClick={() => onRestoreSource(item.id)} aria-label="Restore folder" title="Restore folder">
